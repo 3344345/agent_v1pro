@@ -40,4 +40,6 @@ tzdata==2026.3
 urllib3==2.7.0
 websocket-client==1.9.2
 xlsxwriter==3.2.9
+chromadb
 fastembed
+llama-cpp-python
