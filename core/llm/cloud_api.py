@@ -11,6 +11,8 @@ class CloudApiBackend(LLMBackend):
         self.session = requests.Session()
 
     def chat(self, model, messages, tools=None, options=None, timeout=None) -> dict:
+        from config import CLOUD_MODEL_NAME
+        real_model = CLOUD_MODEL_NAME
         url = f"{CLOUD_API_BASE.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {CLOUD_API_KEY}",
@@ -19,7 +21,7 @@ class CloudApiBackend(LLMBackend):
         
         opts = options or {}
         payload = {
-            "model": model or CLOUD_MODEL_NAME,
+            "model": real_model,
             "messages": messages,
             "temperature": opts.get("temperature", 0.1),
         }

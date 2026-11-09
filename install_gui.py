@@ -310,7 +310,7 @@ class InstallWizard:
             # ================= 1. 生成 .env 与 模型准备 =================
             if mode == "ollama":
                 self.log(t["log_ollama_prep"])
-                if subprocess.run(["which", "ollama"], capture_output=True).returncode != 0:
+                if shutil.which("ollama") is None:
                     self.log(t["log_ollama_install"])
                     subprocess.run(["curl", "-fsSL", "https://ollama.com/install.sh", "-o", "/tmp/ollama.sh"], check=True)
                     subprocess.run(["sh", "/tmp/ollama.sh"], check=True)
@@ -395,10 +395,10 @@ class InstallWizard:
             self.root.after(0, lambda: messagebox.showinfo(t["msg_success_title"], t["msg_success_text"]))
 
         except Exception as e:
-            self.log(f"\n❌ {str(e)}")
-            self.root.after(0, lambda: self.btn_install.config(state="normal", text=t["btn_fail"], bg="#cf222e"))
-            self.root.after(0, lambda: messagebox.showerror(t["msg_err_title"], str(e)))
-
+            err_msg = str(e)  # 提前转字符串
+            self.log(f"\n❌ 错误: {err_msg}")
+            self.root.after(0, lambda msg=err_msg: self.btn_install.config(state="normal", text="❌ 失败", bg="#cf222e"))
+            self.root.after(0, lambda msg=err_msg: messagebox.showerror("安装失败", msg))
 if __name__ == "__main__":
     root = tk.Tk()
     app = InstallWizard(root)

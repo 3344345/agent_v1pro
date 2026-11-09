@@ -7,13 +7,40 @@ from typing import List, Optional, Tuple, Callable
 from config import EXEC_SHELL
 from core.sys_utils import start_process, kill_process_tree
 
+# ========== 开发者防呆安全配置 ==========
 BLACKLIST_PATTERNS = [
-    r"\brm\s+-rf\s+/\s*$", r"\brm\s+-rf\s+/\*", r"\brm\s+-rf\s+~/?\s*$",
-    r"\bmkfs\b", r"\bdd\s+.*of=/dev/[sh]d", r">\s*/dev/[sh]d",
-    r":\(\)\s*\{.*\}\s*;", r"\bchmod\s+-R\s+777\s+/\b", r"\bchown\s+-R\s+.*\s+/\s*$",
+    # 1. 致命木马执行 (直接拒绝，不给确认机会)
+    r"curl\s+.*\|\s*(bash|sh)",
+    r"wget\s+.*\|\s*(bash|sh)",
+    r"eval\s*\$\(",
+    
+    # 2. 核心资产破坏 (直接拒绝)
+    r"\brm\s+-rf?\s+.*\.git",
+    r"\brm\s+-rf?\s+/\s*$",
+    r"\brm\s+-rf?\s+/\*",
+    r"\brm\s+-rf?\s+~/?\s*$",
+    r"\bmv\s+.*\.git",
+    r"\bmkfs\b",
+    r"\bdd\s+.*of=/dev/[sh]d",
+    r">\s*/dev/[sh]d",
 ]
-PROTECTED_PATHS = ["/etc/", "/usr/", "/boot/", "/sys/", "/proc/", "/var/log/"]
-NEED_CONFIRM_KEYWORDS = ["sudo", " rm ", "rm -", "apt remove", "apt purge", "dpkg -i", "chmod 777", "chown", " kill ", "pkill", "systemctl stop"]
+
+# 需要用户二次确认的关键词（在终端或 GUI 弹窗）
+NEED_CONFIRM_KEYWORDS = [
+    "sudo", 
+    " rm ", "rm -", 
+    "apt remove", "apt purge", "dpkg -i",
+    "pip uninstall", "conda remove",
+    "chmod 777", "chown", 
+    " kill ", "pkill", "systemctl stop",
+    "cat .env", "cat ~/.ssh", "cat /etc/shadow",
+]
+
+# 受保护的目录，写入时必须确认
+PROTECTED_PATHS = [
+    "/etc/", "/usr/", "/boot/", "/sys/", "/proc/", "/var/log/",
+    ".git/", 
+]
 READONLY_COMMANDS = {
     "ls", "cat", "head", "tail", "wc", "grep", "find", "which", "file", "stat", "du", "df", "tree", "pwd", "whoami", "date", "uptime", "echo", "ping", "ps", "top", "free", "uname", "hostname", "id", "ip", "ifconfig", "netstat", "ss", "route", "traceroute", "nslookup", "dig", "host", "curl", "wget",
 }

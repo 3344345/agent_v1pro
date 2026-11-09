@@ -1,8 +1,5 @@
 """
 LLM 后端统一入口 + 空响应兜底。
-
-- planner 后端：config.LLM_BACKEND
-- router 后端：config.ROUTER_BACKEND（当前固定 llamacpp_server on CPU）
 """
 
 from typing import Optional
@@ -49,7 +46,6 @@ def make_backend(name: str = None, profile: str = "planner") -> LLMBackend:
 
 
 def get_backend() -> LLMBackend:
-    """planner 后端单例"""
     global _backend
     if _backend is None:
         _backend = make_backend(LLM_BACKEND, profile="planner")
@@ -57,7 +53,6 @@ def get_backend() -> LLMBackend:
 
 
 def get_router_backend() -> LLMBackend:
-    """router 后端单例（CPU 1.5B）"""
     global _router_backend
     if _router_backend is None:
         _router_backend = make_backend(ROUTER_BACKEND, profile="router")
@@ -65,7 +60,6 @@ def get_router_backend() -> LLMBackend:
 
 
 def reset_backend() -> None:
-    """关闭并清空两个后端"""
     global _backend, _router_backend
     for b in (_backend, _router_backend):
         if b is not None:
@@ -78,7 +72,6 @@ def reset_backend() -> None:
 
 
 def switch_backend(name: str) -> LLMBackend:
-    """运行时切换 planner 后端"""
     global _backend
     if _backend is not None:
         try:
@@ -114,6 +107,8 @@ def _is_empty_response(result: dict):
 
 # ========== 上层统一入口 ==========
 def call_planner(messages, tools=None, retry=True, log_fn=None):
+    from runtime.stop_token import get_current  # <--- 延迟导入
+
     def _log(level, msg, extra=None):
         if log_fn:
             log_fn(level, msg, stage="llm", extra=extra)
@@ -121,44 +116,73 @@ def call_planner(messages, tools=None, retry=True, log_fn=None):
             log_event(level, msg, stage="llm", extra=extra)
 
     backend = get_backend()
-
-    result = backend.chat(PLANNER_MODEL, messages, tools, PLANNER_OPTIONS)
-    if "error" in result:
-        return result
-
-    is_empty, reason, meta = _is_empty_response(result)
-    if not is_empty:
-        return result
-
-    _log("warning", "模型空响应", {"attempt": 1, "reason": reason, **meta})
-    if not retry:
-        return {"error": "模型空响应", "stage": "empty_response", "meta": meta}
-
-    retry_messages = list(messages) + [{"role": "user", "content": "请用简洁的中文总结当前进展。不要再调用工具。"}]
-    _log("info", f"空响应重试：追加总结提示（保留 {len(messages)} 条上下文）")
-    result = backend.chat(PLANNER_MODEL, retry_messages, tools=None, options=PLANNER_OPTIONS)
     
-    if "error" in result: return result
-    is_empty, reason, meta = _is_empty_response(result)
-    if not is_empty: return result
+    token = get_current()
+    if token:
+        token.register_backend(backend)
+        
+    try:
+        result = backend.chat(PLANNER_MODEL, messages, tools, PLANNER_OPTIONS)
+        if "error" in result:
+            return result
 
-    _log("warning", "模型空响应", {"attempt": 2, "reason": reason, **meta})
+        is_empty, reason, meta = _is_empty_response(result)
+        if not is_empty:
+            return result
 
-    retry_messages.append({"role": "user", "content": "请直接输出文字总结，不要再调用工具，也不要返回空内容。"})
-    _log("info", "空响应重试：强制要求文字输出")
-    result = backend.chat(PLANNER_MODEL, retry_messages, tools=None, options=PLANNER_OPTIONS)
-    
-    if "error" in result: return result
-    is_empty, reason, meta = _is_empty_response(result)
-    if not is_empty: return result
+        _log("warning", "模型空响应", {"attempt": 1, "reason": reason, **meta})
+        if not retry:
+            return {"error": "模型空响应", "stage": "empty_response", "meta": meta}
 
-    _log("error", "模型连续三次空响应", {"attempt": 3, "reason": reason, **meta})
-    return {"error": "模型连续空响应", "stage": "empty_response", "meta": meta}
+        retry_messages = list(messages) + [{"role": "user", "content": "请用简洁的中文总结当前进展。不要再调用工具。"}]
+        _log("info", f"空响应重试：追加总结提示（保留 {len(messages)} 条上下文）")
+        result = backend.chat(PLANNER_MODEL, retry_messages, tools=None, options=PLANNER_OPTIONS)
+        
+        if "error" in result: return result
+        is_empty, reason, meta = _is_empty_response(result)
+        if not is_empty: return result
+
+        _log("warning", "模型空响应", {"attempt": 2, "reason": reason, **meta})
+
+        retry_messages.append({"role": "user", "content": "请直接输出文字总结，不要再调用工具，也不要返回空内容。"})
+        _log("info", "空响应重试：强制要求文字输出")
+        result = backend.chat(PLANNER_MODEL, retry_messages, tools=None, options=PLANNER_OPTIONS)
+        
+        if "error" in result: return result
+        is_empty, reason, meta = _is_empty_response(result)
+        if not is_empty: return result
+
+        _log("error", "模型连续三次空响应", {"attempt": 3, "reason": reason, **meta})
+        return {"error": "模型连续空响应", "stage": "empty_response", "meta": meta}
+        
+    finally:
+        if token:
+            token.unregister_backend(backend)
 
 
-def call_router(messages):
-    return get_router_backend().chat(ROUTER_MODEL, messages, options=ROUTER_OPTIONS)
+def call_router(messages, tools=None):
+    from runtime.stop_token import get_current  # <--- 延迟导入
+
+    backend = get_router_backend()
+    token = get_current()
+    if token:
+        token.register_backend(backend)
+    try:
+        return backend.chat(ROUTER_MODEL, messages, tools=tools, options=ROUTER_OPTIONS)
+    finally:
+        if token:
+            token.unregister_backend(backend)
 
 
 def call_validator(messages):
-    return get_router_backend().chat(ROUTER_MODEL, messages, options=ROUTER_OPTIONS)
+    from runtime.stop_token import get_current  # <--- 延迟导入
+
+    backend = get_router_backend()
+    token = get_current()
+    if token:
+        token.register_backend(backend)
+    try:
+        return backend.chat(ROUTER_MODEL, messages, options=ROUTER_OPTIONS)
+    finally:
+        if token:
+            token.unregister_backend(backend)

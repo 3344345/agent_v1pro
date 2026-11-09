@@ -7,9 +7,11 @@
 cd "$(dirname "$0")" || exit 1
 
 # 2. 自动加载 .env 环境变量
+# 替换为这段：
 if [ -f ".env" ]; then
-    # 过滤注释并按行导出
-    export $(grep -v '^#' .env | grep -v '^$' | xargs)
+    set -a
+    source .env
+    set +a
 fi
 
 # 3. 基础路径配置
