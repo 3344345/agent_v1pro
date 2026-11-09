@@ -6,15 +6,15 @@
 
 ## English
 
-A local-first, multi-engine AI Agent runtime featuring long-term memory, self-correction mechanisms, and anti-deadlock defenses.
+A local-first, multi-backend AI Agent runtime exploring long-term memory, self-correction, and basic guardrails for local small language models.
 
 ### ✨ Features
 
-- **Multi-Backend Support**: Seamlessly switch between local deployment via **Ollama**, native **llama.cpp**, and pure **Cloud API** (e.g., DeepSeek).
-- **Lightweight Memory**: Cloud mode uses `fastembed` for zero-Ollama-dependency local vector retrieval.
-- **Logs as History**: Abandons redundant database tables; mechanically extracts action sequences with timestamps directly from logs.
-- **Cross-Platform**: Fully compatible with Linux, macOS, and Windows. Includes a bilingual GUI installation wizard.
-- **Anti-Hallucination & Deadlocks**: Context shrinking, tool failure intervention, and strict reflection prompts to prevent memory pollution.
+- **Multi-Backend Support**: Supports switching between local deployment via **Ollama**, native **llama.cpp**, and pure **Cloud API** (e.g., DeepSeek).
+- **Lightweight Memory**: Cloud mode optionally uses `fastembed` for local vector retrieval, eliminating the dependency on deploying a local Ollama instance for memory features.
+- **Logs as History**: Simplifies the architecture by extracting action sequences directly from JSONL logs instead of maintaining redundant database tables.
+- **Cross-Platform**: Initial adaptations for Linux, macOS, and Windows, including a basic graphical installation wizard.
+- **Guardrails & Interventions**: Includes basic context shrinking, tool failure interventions, and prompt constraints to mitigate memory pollution and infinite loops.
 
 ### ⚠️ Critical Warning: Embedding Dimension Conflict
 
@@ -72,15 +72,15 @@ python scripts/memory_admin.py list
 
 ## 简体中文
 
-本地优先、多引擎驱动、具备长期记忆与自我防暴走机制的智能 Agent 运行时。
+一个本地优先、多后端支持的 AI Agent 运行时，主要探索本地小模型在长期记忆、自我纠错和基础防线上的工程化落地。
 
 ### ✨ 核心特性
 
-- **多后端引擎**：完美支持 **Ollama** 本地部署、原生 **llama.cpp** 以及纯 **云端 API**（如 DeepSeek）。
-- **轻量化记忆**：云端模式采用 `fastembed` 实现零 Ollama 依赖的本地向量检索，纯 CPU 运行。
-- **日志即历史**：废弃冗余数据库流水表，直接从 JSONL 日志提取带时间戳的动作序列作为上下文。
-- **跨平台兼容**：完美适配 Linux、macOS 与 Windows，提供中英双语的图形化配置向导。
-- **防暴走与防幻觉**：内置上下文压缩、工具失败干预与严格的反思 Prompt，防止记忆污染。
+- **多后端引擎**：支持在 **Ollama** 本地部署、原生 **llama.cpp** 以及纯 **云端 API**（如 DeepSeek）之间切换。
+- **轻量化记忆**：云端模式下可选择使用 `fastembed` 进行本地向量检索，省去了为了记忆功能而额外部署本地 Ollama 的麻烦。
+- **日志即历史**：简化架构，直接从 JSONL 日志中提取动作序列作为上下文，去除了多余的流水表依赖。
+- **跨平台兼容**：对 Linux、macOS 与 Windows 做了初步适配，并提供了基础的图形化配置向导。
+- **基础防呆机制**：内置了基础的上下文压缩、工具失败干预与反思约束，用于缓解记忆污染和死循环问题。
 
 ### ⚠️ 重要警告：向量维度冲突
 
@@ -95,7 +95,7 @@ rm -rf data/chroma
 
 ### 🚀 极简安装
 
-#### 1. 一行命令极速安装（推荐）
+#### 1. 一行命令安装（推荐）
 
 **macOS / Linux 用户：**
 ```bash
