@@ -4,7 +4,7 @@ main.py 不用改。
 """
 
 from core.memory import get_store
-from core.memory.context_builder import build_focus_context
+from core.context_builder import build_focus_context
 
 
 def init_db():

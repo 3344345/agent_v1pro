@@ -10,15 +10,16 @@ from datetime import datetime
 import difflib
 
 from config import (
-    LOG_FILE, MAX_ATTEMPTS, FAILURE_THRESHOLD, SAME_CALL_THRESHOLD,
+    LOG_FILE, MAX_ATTEMPTS, FAILURE_THRESHOLD,
     HISTORY_LIMIT, COMPRESS_KEEP_RECENT, COMPRESS_MAX_CHARS, ENABLE_LOG_ROTATION,
     MAX_SYS_CHARS, MAX_OUTPUT_CHARS, SHRINK_KEEP_HEAD, SHRINK_KEEP_TAIL,
-    SHRINK_MAX_CHARS, SHRINK_MIN_CHARS, SEARCH_INTERVENE_THRESHOLD,
-    TOOL_FAIL_INTERVENE_THRESHOLD, SIGNATURE_WINDOW_SIZE, SIGNATURE_DUP_THRESHOLD,
+    SHRINK_MAX_CHARS, SHRINK_MIN_CHARS,
+    TOOL_FAIL_INTERVENE_THRESHOLD,
     REFLECT_MAX_LEN, REFLECT_CAUSAL_WORDS, DIALOGUE_KEYWORDS,
     ENABLE_PREFERENCE_MEMORY, MEMORY_TOP_K, MEMORY_MIN_SCORE, OUTPUT_DIR,
     SIMILARITY_WINDOW_SIZE, SIMILARITY_ARGS_THRESHOLD, SIMILARITY_OUT_THRESHOLD,
-    HISTORY_INVALID_MINUTES, HISTORY_INJECT_LIMIT
+    MAX_REFLECT_COUNT, RAG_INTERVENE_TOP_K, RAG_INTERVENE_MIN_SCORE,
+    PLANNING_KEYWORDS, REFLECT_CONTINUE_FLAG, REFLECT_STOP_FLAG,SIGNATURE_DUP_THRESHOLD
 )
 from prompts import AGENT_SYSTEM_PROMPT, REFLECT_PROMPT_TEMPLATE
 from core.llm import call_planner, reset_backend
@@ -30,6 +31,7 @@ import tools
 from registries import tool_registry as registry
 from core.memory import get_store
 from core.memory.compressor import maybe_compress
+from core.context_builder import build_agent_context, build_focus_context
 from runtime import AgentRuntime
 from runtime.frontends.cli import CLIFrontend
 from runtime.stop_token import StopException
@@ -66,7 +68,6 @@ def _is_tool_failure(output: str) -> bool:
 
 
 def _shrink_messages(messages):
-    """压缩 messages 中间的老 tool 消息，防止上下文爆掉。"""
     if len(messages) <= SHRINK_KEEP_HEAD + SHRINK_KEEP_TAIL:
         return messages
 
@@ -89,57 +90,39 @@ def _shrink_messages(messages):
 
 
 def _validate_memory(content: str, category: str) -> bool:
-    """反思记忆的硬校验安检机。返回 True 表示通过，False 表示拦截。"""
-    # 1. 长度硬限制
     if len(content) > REFLECT_MAX_LEN:
         print(f"🚫 [反思] 记忆超长（>{REFLECT_MAX_LEN}字），已丢弃。")
         return False
-        
-    # 2. 格式硬限制（不能包含代码块或 markdown 符号）
     if "```" in content or "`" in content:
         print("🚫 [反思] 记忆包含代码块，已丢弃。")
         return False
-
-    # 3. 假因果硬拦截（防止甩锅式反思污染）
     if any(w in content for w in REFLECT_CAUSAL_WORDS):
         print(f"🚫 [反思] 包含因果臆断词，已丢弃。")
         return False
-
-    # 4. 类别管控与白名单
     if not ENABLE_PREFERENCE_MEMORY and category == "preference":
         print("🚫 [反思] 偏好记忆已在配置中禁用，本次记录作废。")
         return False
-        
     if category not in ("preference", "knowledge", "lesson"):
         print(f"🚫 [反思] 非法类别 '{category}'，已丢弃。")
         return False
-
     return True
 
 
 def _reflect_and_remember(user_input, tool_history, final_content):
-    """任务/对话结束后的独立反思。"""
     summary_lines = [f"  {i}. {h['tool']}({str(h['args'])[:100]})" for i, h in enumerate(tool_history or [], 1)]
-    
-    # 核心重写：极其严格的反思 Prompt（直接拼接，避开 format 冲突）
     reflect_prompt = (
-        "\n\n---\n"
-        "[系统：任务已结束]\n\n"
-        f"原始任务：{user_input}\n\n调用序列：\n"
-        + "\n".join(summary_lines)
-        + f"\n\n最终结果：{(final_content or '')[:200]}\n\n"
-        + REFLECT_PROMPT_TEMPLATE
+        "\n\n---\n[系统：任务已结束]\n\n"
+        f"原始任务：{user_input}\n\n调用序列：\n" + "\n".join(summary_lines)
+        + f"\n\n最终结果：{(final_content or '')[:200]}\n\n" + REFLECT_PROMPT_TEMPLATE
     )
 
     print("\n" + "─" * 50)
     print("🤔 [反思] 正在评估任务经验...")
-    log_event("debug", "开始任务反思", stage="memory", event="memory.reflect_start")
-
+    
     try:
         result = call_planner([{"role": "user", "content": reflect_prompt}], tools=None, retry=False, log_fn=log_event)
     except Exception as e:
         print(f"⚠️ [反思] 调用失败: {e}")
-        log_event("warning", f"反思失败: {e}", stage="memory")
         return
 
     if "error" in result:
@@ -157,7 +140,6 @@ def _reflect_and_remember(user_input, tool_history, final_content):
         data = json.loads(json_str)
     except Exception:
         print(f"⚠️ [反思] JSON 解析失败，原始输出: {raw[:100]}...")
-        log_event("warning", f"反思 JSON 解析失败: {raw[:100]}", stage="memory")
         return
 
     if not data or "content" not in data: return
@@ -165,7 +147,6 @@ def _reflect_and_remember(user_input, tool_history, final_content):
     content = data.get("content", "").strip()
     category = data.get("category", "knowledge")
 
-    # 送进安检机，不通过直接扔
     if not _validate_memory(content, category):
         return
 
@@ -175,7 +156,6 @@ def _reflect_and_remember(user_input, tool_history, final_content):
         if existing:
             hit_id = existing[0]["id"]
             print(f"🔄 [反思] 发现高度相似记忆 (id={hit_id}, 相似度 {existing[0]['score']:.2f})")
-            log_event("info", f"反思记忆高度相似，触发权重更新", stage="memory")
             try:
                 with store._conn() as conn:
                     conn.execute("UPDATE memories SET hit_count = hit_count + 1, weight = weight + 0.1 WHERE id = ?", (hit_id,))
@@ -188,18 +168,16 @@ def _reflect_and_remember(user_input, tool_history, final_content):
         print(f"🧠 [反思] 已存入长期记忆！")
         print(f"   类别: {category}")
         for line in content.split("\n"): print(f"   {line}")
-        log_event("info", f"反思记忆已保存: [{category}] {content[:40]}...", stage="memory")
     except Exception as e:
         print(f"⚠️ [反思] 存储失败: {e}")
-        log_event("warning", f"反思记忆保存失败: {e}", stage="memory")
     finally:
         print("─" * 50 + "\n")
 
 
 def _summarize_session():
-    from core.memory.context_builder import _read_recent_turns_from_log
+    from core.log_reader import read_recent_turns
     try:
-        turns = _read_recent_turns_from_log(limit=20)
+        turns = read_recent_turns(limit=20)
         if not turns: return
         lines = []
         for t in turns:
@@ -207,20 +185,17 @@ def _summarize_session():
             if t.get("reply"): lines.append(f"Agent: {t['reply'][:50]}")
         
         prompt = "以下是本次会话的操作记录。请用 100 字以内总结用户今天主要让我做了什么：\n" + "\n".join(lines)
-        log_event("debug", "开始会话总结", stage="memory", event="memory.summary_start")
         result = call_planner([{"role": "user", "content": prompt}], tools=None, retry=False)
         
         if "error" not in result:
             summary = (result["message"]["content"] or "").strip()
             if summary:
                 get_store().save(category="session_log", content=summary, source="session_summary")
-                log_event("info", "会话总结已保存", stage="memory")
     except Exception as e:
         log_event("warning", f"会话总结失败: {e}", stage="memory")
 
 
 def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=None):
-    """统一 Agent 循环。"""
     all_schemas = registry.get_schemas()
     if not all_schemas:
         log_event("warning", "无可用工具", stage="tool_call")
@@ -229,67 +204,16 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
 
     log_event("info", f"agent 启动: hint={hint} max_attempts={MAX_ATTEMPTS} summary={intent_summary[:50]}", stage="tool_call")
 
-    # ====== 组装 system prompt ======
-    parts = []
-    if focus_ctx: parts.append(focus_ctx)
-    parts.append(f"用户意图参考：{intent_summary}")
-    if keywords: parts.append(f"关键词：{', '.join(keywords)}")
-    if hint == "high": parts.append("提示：这个任务可能比较复杂，建议先调用 plan_todos 规划。")
-    parts.append("")
-
-    try:
-        from core.memory.context_builder import _read_recent_turns_from_log
-        recent_turns = _read_recent_turns_from_log(limit=HISTORY_INJECT_LIMIT) # 👈 使用配置
-        if recent_turns:
-            parts.append("[最近几轮历史]")
-            for t in recent_turns:
-                ts_str = t.get("ts")
-                prefix = ""
-                if ts_str:
-                    try:
-                        last_time = datetime.fromisoformat(ts_str)
-                        delta_min = (datetime.now() - last_time).total_seconds() / 60
-                        if delta_min > HISTORY_INVALID_MINUTES: # 👈 使用配置
-                            prefix = "[⚠️ 状态可能失效] "
-                    except Exception: pass
-                parts.append(f"  {prefix}用户: {t.get('user_input', '')[:80]}")
-                for s in t.get("steps", []):
-                    if s["type"] == "call": parts.append(f"    执行: {s['tool']} 参数: {s['args']}")
-                    elif s["type"] == "result": parts.append(f"    结果: {s['content']}")
-                if t.get("reply"): parts.append(f"    Agent回复: {t['reply'][:100]}")
-            parts.append("")
-    except Exception as e:
-        log_event("warning", f"历史读取失败: {e}", stage="memory")
-
-    try:
-        relevant = get_store().search(
-            query=user_input,
-            categories=["preference", "knowledge", "lesson", "command", "session_log", "skill"],
-            top_k=MEMORY_TOP_K, min_score=MEMORY_MIN_SCORE,
-        )
-    except Exception as e:
-        log_event("warning", f"记忆检索失败: {e}", stage="memory")
-        relevant = []
-
-    if relevant:
-        parts.append("[相关记忆]")
-        for r in relevant:
-            cat = r.get("category", "?")
-            content = (r.get("content") or "")
-            score = r.get("final_score", r.get("score", 0))
-            if cat in ("command", "skill"):
-                parts.append(f"  [{cat} {score:.2f}]")
-                for line in content.split("\n"): parts.append(f"    {line}")
-            else:
-                if len(content) > 200: content = content[:200] + "..."
-                parts.append(f"  [{cat} {score:.2f}] {content}")
-        parts.append("")
-
-    log_event("debug", f"记忆检索: {len(relevant)} 条", stage="memory", event="memory.search",
-              extra={"query": user_input[:40], "hits": [(r["category"], r["score"]) for r in relevant]})
-
-    parts.append(AGENT_SYSTEM_PROMPT)
-    system_content = "\n".join(parts)
+    # 👇 1. 调用工厂：获取上下文和已注入的 Skill ID
+    system_content, injected_skill_ids = build_agent_context(
+        store=get_store(),
+        user_input=user_input,
+        focus_ctx=focus_ctx,
+        intent_summary=intent_summary,
+        hint=hint,
+        keywords=keywords,
+        base_system_prompt=AGENT_SYSTEM_PROMPT
+    )
     
     if len(system_content) > MAX_SYS_CHARS:
         log_event("warning", f"system_content 超长 ({len(system_content)} 字符)，强制截断", stage="tool_call", event="agent.ctx_overflow")
@@ -302,16 +226,14 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
         {"role": "user", "content": user_input},
     ]
 
-    # ====== 循环变量初始化 ======
     last_tool = None
     last_args = None
     tool_history = []
     final_content = None
     failure_counts = {}
     stuck_reason = None
-    
-    # 核心改动：使用配置中的窗口大小
-    recent_actions = deque(maxlen=SIMILARITY_WINDOW_SIZE) # 👈 使用配置
+    total_reflect_count = 0 
+    recent_actions = deque(maxlen=SIMILARITY_WINDOW_SIZE)
 
     for step in range(1, MAX_ATTEMPTS + 1):
         if stop_token is not None: stop_token.check()
@@ -331,15 +253,10 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
 
         if not tool_calls:
             final_content = (msg.get("content") or "").strip()
-            
-            # 【拦截纯文本计划，强制打回】
-            is_planning = any(w in final_content for w in ["接下来打算", "下一步", "换种思路", "我准备", "接下来我"])
+            is_planning = any(w in final_content for w in PLANNING_KEYWORDS)
             if is_planning and step < MAX_ATTEMPTS:
                 messages.append({"role": "assistant", "content": final_content})
-                messages.append({
-                    "role": "user", 
-                    "content": "【系统强制干预】你刚刚输出了计划，但没有调用工具。请立刻执行你计划中的第一步，直接产生 tool_call，不要只说不做！"
-                })
+                messages.append({"role": "user", "content": "【系统干预】你刚刚输出了计划，但没有调用工具。请立刻执行你计划中的第一步。"})
                 log_event("warning", "拦截到纯文本计划，强制要求继续执行", stage="tool_call")
                 continue 
                 
@@ -382,53 +299,105 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
             last_args = func_args
             tool_history.append({"tool": func_name, "args": func_args})
 
-            # ================= 相似度与失败双重熔断 =================
             if _is_tool_failure(output):
                 failure_counts[func_name] = failure_counts.get(func_name, 0) + 1
             else:
                 failure_counts[func_name] = 0
 
             hit_loop = False
+            similar_count = 0  # 👈 新增：记录相似的次数
+            
             for prev_tool, prev_args_str, prev_out in recent_actions:
                 if prev_tool == func_name:
                     sim_args = difflib.SequenceMatcher(None, current_args_str, prev_args_str).ratio()
                     sim_out = difflib.SequenceMatcher(None, output, prev_out).ratio()
                     
-                    # 👈 使用配置中的阈值
                     if sim_args > SIMILARITY_ARGS_THRESHOLD or sim_out > SIMILARITY_OUT_THRESHOLD:
-                        hit_loop = True
-                        log_event("warning", f"工具 {func_name} 触发相似度熔断 (args_sim={sim_args:.2f}, out_sim={sim_out:.2f})", stage="tool_call")
-                        break
+                        similar_count += 1  # 👈 找到一个相似的，不立刻退出，而是计数
+            
+            # 👈 核心逻辑：只有当相似次数达到 SIGNATURE_DUP_THRESHOLD（你配的 3）时才熔断
+            if similar_count >= SIGNATURE_DUP_THRESHOLD:
+                hit_loop = True
+                log_event("warning", f"工具 {func_name} 触发相似度熔断 (窗口内相似 {similar_count} 次)", stage="tool_call")
             
             recent_actions.append((func_name, current_args_str, output))
 
             if hit_loop or failure_counts.get(func_name, 0) >= TOOL_FAIL_INTERVENE_THRESHOLD:
-                log_event("warning", f"触发阶段反思 (失败次数:{failure_counts.get(func_name, 0)}, 相似度死循环:{hit_loop})", stage="memory")
+                total_reflect_count += 1
+                
+                if total_reflect_count >= MAX_REFLECT_COUNT:
+                    log_event("warning", f"任务已触发 {total_reflect_count} 次反思，系统强制熔断", stage="tool_call")
+                    stuck_reason = f"连续触发 {total_reflect_count} 次死循环反思，系统判定无解"
+                    break
+
+                log_event("warning", f"触发阶段反思 (第 {total_reflect_count} 次, 失败次数:{failure_counts.get(func_name, 0)}, 相似度死循环:{hit_loop})", stage="memory")
                 
                 messages.append({
                     "role": "user",
                     "content": (
                         "⚠️ 系统干预：检测到你陷入了重复尝试或死循环。\n"
-                        "请立刻停止当前尝试！用一句话简述你的反思。\n"
-                        "【判定规则】如果你认为换个参数、工具或思路还能救，请以 **[继续执行]** 开头回答；如果你认为已进入死胡同（如缺依赖、无权限），请以 **[终止任务]** 开头回答。"
+                        "请立刻停止当前尝试！用一句话简述：你遇到了什么报错？你原本想做什么？接下来你打算换什么别的思路？\n"
+                        f"【判定规则】如果你认为换个思路还能救，请以 {REFLECT_CONTINUE_FLAG} 开头；如果已进入死胡同，请以 {REFLECT_STOP_FLAG} 开头。"
                     )
                 })
                 
                 reflect_res = call_planner(messages, tools=None, retry=True, log_fn=log_event)
-                if "error" not in reflect_res:
-                    reflect_text = reflect_res.get("message", {}).get("content", "")
-                    messages.append({"role": "assistant", "content": f"[自我反思] {reflect_text}"})
-                    print(f"\n🧠 [阶段反思] {reflect_text}\n")
+                if "error" in reflect_res:
+                    failure_counts[func_name] = 0
+                    continue
                     
-                    if "[终止任务]" in reflect_text:
-                        log_event("info", "模型自我判定任务无法继续，允许结束", stage="tool_call")
-                        final_content = f"任务被终止。反思结论：{reflect_text.replace('[终止任务]', '').strip()}"
-                        break 
+                reflect_text = reflect_res.get("message", {}).get("content", "")
+                messages.append({"role": "assistant", "content": f"[初步反思] {reflect_text}"})
+                print(f"\n🧠 [阶段反思 {total_reflect_count}/{MAX_REFLECT_COUNT}] {reflect_text}\n")
+
+                if REFLECT_STOP_FLAG in reflect_text:
+                    log_event("info", "模型自我判定任务无法继续，允许结束", stage="tool_call")
+                    final_content = f"任务被终止。反思结论：{reflect_text.replace(REFLECT_STOP_FLAG, '').strip()}"
+                    break 
+                
+                rag_hint = ""
+                try:
+                    search_query = f"任务上下文: {focus_ctx[:100] if focus_ctx else ''}\n"
+                    search_query += f"工具: {func_name}\n"
+                    search_query += f"报错/结果: {output[:200]}\n"
+                    search_query += f"它的反思: {reflect_text}\n"
+                    
+                    all_relevant = get_store().search(
+                        query=search_query,
+                        categories=["skill", "lesson", "command"],
+                        top_k=RAG_INTERVENE_TOP_K,
+                        min_score=RAG_INTERVENE_MIN_SCORE
+                    )
+                    
+                    # 👇 核心：过滤已注入的 Skill，防止重复投喂
+                    filtered_relevant = []
+                    for r in all_relevant:
+                        if r.get("category") == "skill":
+                            if r["id"] in injected_skill_ids:
+                                continue
+                            else:
+                                injected_skill_ids.add(r["id"])
+                        filtered_relevant.append(r)
+                    
+                    if filtered_relevant:
+                        rag_hint = "\n【系统为你查阅了相关操作手册】\n"
+                        for r in filtered_relevant:
+                            cat = r.get("category", "?")
+                            rag_hint += f"- [{cat}] {r['content']}\n"
+                        log_event("info", f"系统精准RAG命中了 {len(filtered_relevant)} 条提示", stage="memory")
+                        print(f"📖 [系统 RAG 投喂] 找到了 {len(filtered_relevant)} 条新经验！\n")
                     else:
-                        messages.append({
-                            "role": "user", 
-                            "content": "【系统强制唤醒】既然你没有放弃，请立刻按照你的反思结论，调用合适的工具继续执行任务！不要再输出纯文本，直接产生 tool_call！"
-                        })
+                        rag_hint = "\n【系统提示】本地手册中没有找到完全对应的新解法，请尝试完全不同的工具或终止任务。\n"
+                except Exception as e:
+                    log_event("warning", f"自动RAG失败: {e}", stage="memory")
+
+                messages.append({
+                    "role": "user", 
+                    "content": (
+                        f"{rag_hint}\n"
+                        "【系统提示】请结合上述经验继续推进任务。你可以选择发起合适的工具调用来解决问题，如果已有足够信息也可以直接得出结论。请继续。"
+                    )
+                })
                 
                 failure_counts[func_name] = 0
                 recent_actions.clear()
@@ -442,7 +411,6 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                 break
         if stuck_reason: break
 
-    # ====== 任务结束后的收尾处理 ======
     if stuck_reason:
         log_event("warning", f"检测到卡死，停止尝试：{stuck_reason}", stage="tool_call", event="agent.stuck", extra={"reason": stuck_reason})
         print(f"\n⚠️ 检测到卡死：{stuck_reason}\n")
@@ -500,7 +468,7 @@ def handle_input(user_input, runtime):
     except Exception as e:
         log_event("warning", f"上下文压缩失败: {e}", stage="memory")
 
-    focus_ctx = focus_to_context()
+    focus_ctx = build_focus_context(get_store())
     get_context().reset()
 
     r = route(user_input, log_fn=log_event)

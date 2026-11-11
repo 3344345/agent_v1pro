@@ -1,9 +1,11 @@
 """
 browser 工具后端。Playwright + Chromium。
+包含底层自动等待（Auto-Wait）和自动标签页同步。
 """
 
 import os
 import time
+import subprocess
 from typing import Optional, Callable
 
 from playwright.sync_api import sync_playwright, BrowserContext, Page, Playwright
@@ -14,12 +16,14 @@ from config import (
 )
 from logger import log_event
 
+# ========== 自动等待配置 ==========
+AUTO_WAIT_TIMEOUT_MS = 1500  # 动作执行后的强制缓冲时间（毫秒）
+TAB_LOAD_TIMEOUT_MS = 3000   # 等待新标签页加载的极限时间（毫秒）
 
 # ========== 全局单例 ==========
 _pw: Optional[Playwright] = None
 _context: Optional[BrowserContext] = None
 _page: Optional[Page] = None
-
 
 # ========== 会话失效识别 ==========
 _DEAD_MARKERS = (
@@ -27,8 +31,8 @@ _DEAD_MARKERS = (
     "which happens to have exited",
     "target page, context or browser has been closed",
     "targetclosederror",
+    "profile is already in use",
 )
-
 
 def _is_dead_error(e: Exception) -> bool:
     msg = str(e).lower()
@@ -48,6 +52,16 @@ def _reset_session() -> None:
     _context = None
     _page = None
 
+    # 暴力清理残留进程与锁文件
+    try:
+        subprocess.run(["pkill", "-f", BROWSER_PROFILE_DIR], stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        lock_file = os.path.join(BROWSER_PROFILE_DIR, "SingletonLock")
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+    except Exception as e:
+        log_event("warning", f"清理浏览器残留失败: {e}", stage="browser")
+
 
 def _probe(page: Optional[Page]) -> bool:
     if page is None: return False
@@ -61,7 +75,6 @@ def _probe(page: Optional[Page]) -> bool:
 
 def _start_session() -> Page:
     global _pw, _context, _page
-
     if _pw is None:
         _pw = sync_playwright().start()
 
@@ -86,7 +99,40 @@ def _start_session() -> Page:
     return _page
 
 
+def _sync_active_page() -> Optional[Page]:
+    """
+    智能同步最新标签页。
+    如果发现新标签页，先等它加载完成，再切换控制权。
+    """
+    global _page
+    if not _context: return None
+    
+    pages = _context.pages
+    if not pages: return None
+
+    # 如果发现了新标签页（通常是因为点击了 target=_blank 的链接）
+    if len(pages) > 0 and pages[-1] != _page:
+        latest_page = pages[-1]
+        if _probe(latest_page):
+            try:
+                # 🚨 自动等待：等待新页面完成初步的 DOM 加载
+                latest_page.wait_for_load_state("domcontentloaded", timeout=TAB_LOAD_TIMEOUT_MS)
+            except Exception:
+                pass # 哪怕超时也继续，总比直接报错强
+            
+            _page = latest_page
+            _page.set_default_timeout(BROWSER_TIMEOUT)
+            log_event("info", f"检测到新标签页，已自动切换: {_page.url}", stage="browser", event="browser.tab_switched")
+            return _page
+            
+    return _page
+
+
 def _get_page() -> Page:
+    synced = _sync_active_page()
+    if synced and _probe(synced):
+        return synced
+
     if _probe(_page):
         return _page
 
@@ -119,26 +165,22 @@ def _reset_session_with_timeout(timeout: float = 2.0) -> None:
     t.start()
     done.wait(timeout=timeout)
 
-
 def close() -> None:
     _reset_session_with_timeout(timeout=2.0)
 
 
 # ========== 对外接口 ==========
-def _current_url_impl() -> str:
-    return _get_page().url
-
-
 def current_url() -> str:
-    try: return _safe_call(_current_url_impl)
+    try: return _safe_call(lambda: _get_page().url)
     except Exception: return ""
 
 
 def _navigate_impl(url: str) -> str:
     page = _get_page()
     page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+    # 🚨 自动等待
+    page.wait_for_timeout(AUTO_WAIT_TIMEOUT_MS)
     return f"✅ 已打开: {page.url}\n标题: {page.title()}"
-
 
 def navigate(url: str) -> str:
     if not (url.startswith("http://") or url.startswith("https://")):
@@ -149,12 +191,10 @@ def navigate(url: str) -> str:
 
 def _click_impl(selector: str) -> str:
     page = _get_page()
-    # 使用 locator 取代 page.click。
-    # .first 防止匹配到多个元素时报错（Strict mode violation）
-    # Playwright 会自动等待元素出现、可见、并且稳定不抖动后再点击。
     page.locator(selector).first.click(timeout=BROWSER_TIMEOUT)
+    # 🚨 自动等待：给新标签页或 JS 事件一点触发时间
+    page.wait_for_timeout(AUTO_WAIT_TIMEOUT_MS)
     return f"✅ 已点击: {selector}"
-
 
 def click(selector: str) -> str:
     if not selector or not selector.strip(): return "❌ 未提供选择器"
@@ -164,10 +204,8 @@ def click(selector: str) -> str:
 
 def _fill_impl(selector: str, value: str) -> str:
     page = _get_page()
-    # 同理，使用 locator 填入，自动等待输入框出现并聚焦。
     page.locator(selector).first.fill(value, timeout=BROWSER_TIMEOUT)
     return f"✅ 已填充 {selector}"
-
 
 def fill(selector: str, value: str) -> str:
     if not selector or not selector.strip(): return "❌ 未提供选择器"
@@ -178,8 +216,9 @@ def fill(selector: str, value: str) -> str:
 def _press_impl(key: str) -> str:
     page = _get_page()
     page.keyboard.press(key)
+    # 🚨 自动等待：按下回车经常触发跳转或新标签页
+    page.wait_for_timeout(AUTO_WAIT_TIMEOUT_MS)
     return f"✅ 已按键: {key}"
-
 
 def press(key: str) -> str:
     if not key or not key.strip(): return "❌ 未提供按键"
@@ -191,13 +230,8 @@ def _evaluate_impl(js: str):
     page = _get_page()
     result = page.evaluate(js)
     if result is None:
-        return (
-            "（JS 返回了 None）\n"
-            "提示：page.evaluate 返回的是 JS 表达式的值，不是 console.log 的输出。\n"
-            "要拿到数据，请用 return 或直接写表达式，不要用 console.log。\n"
-        )
+        return "（JS 返回了 None）\n提示：page.evaluate 返回的是 JS 表达式的值，不是 console.log 的输出。\n要拿到数据，请用 return 或直接写表达式，不要用 console.log。\n"
     return result
-
 
 def evaluate(js: str):
     if not js or not js.strip(): return "❌ 未提供 JS"
@@ -212,7 +246,6 @@ def _snapshot_impl(max_chars: int) -> str:
     text = page.evaluate(f"() => (document.body ? document.body.innerText : '').slice(0, {max_chars})")
     return "\n".join([f"标题: {title}", f"URL: {url}", f"内容:", text or "(空)"])
 
-
 def snapshot(max_chars: int = 1500) -> str:
     max_chars = max(500, min(max_chars, 5000))
     try: return _safe_call(_snapshot_impl, max_chars)
@@ -223,7 +256,6 @@ def _screenshot_impl(path: str) -> str:
     page = _get_page()
     page.screenshot(path=path, full_page=False)
     return f"✅ 截图已保存: {path}"
-
 
 def screenshot(path: str = None) -> str:
     if not path:
@@ -240,13 +272,12 @@ def wait(seconds: float = 2.0) -> str:
     except Exception as e: return f"❌ 等待失败: {e}"
 
 
-# ========== 为 OCR 补充的物理坐标点击 ==========
 def _mouse_click_impl(x: float, y: float) -> str:
     page = _get_page()
     page.mouse.click(x, y)
+    page.wait_for_timeout(AUTO_WAIT_TIMEOUT_MS)
     return f"✅ 鼠标点击坐标: ({x}, {y})"
 
 def mouse_click(x: float, y: float) -> str:
-    """供 OCR 视觉识别后直接调用物理点击"""
     try: return _safe_call(_mouse_click_impl, x, y)
     except Exception as e: return f"❌ 物理点击失败: {e}"
