@@ -14,7 +14,7 @@ TEXTS = {
     "zh": {
         "title": "Agent V1 Pro 智能配置向导",
         "lang_label": "界面语言:",
-        "warn_text": "⚠️ 注意：切换推理模型（Ollama ↔ 云端）不会丢失记忆。\n但如果切换 Embedding 后端（如在 Ollama 与 fastembed 间切换），会导致向量维度不匹配。\n若需切换 Embedding 后端，必须在终端执行 rm -rf data/chroma 清空旧记忆！",
+        "warn_text": "⚠️ 注意：切换推理模型（Ollama ↔ 云端）不会丢失记忆。\n统一使用 fastembed 进行本地记忆检索，无需额外配置。",
         "frame_backend": "1. 选择推理后端",
         "radio_ollama": "Ollama (推荐，全自动本地部署)",
         "radio_cloud": "云端 API (轻量，纯 Python 本地向量)",
@@ -59,7 +59,7 @@ TEXTS = {
     "en": {
         "title": "Agent V1 Pro Setup Wizard",
         "lang_label": "UI Language:",
-        "warn_text": "⚠️ Warning: Switching inference models (Ollama ↔ Cloud) does not lose memory.\nHowever, switching the Embedding backend (e.g., between Ollama and fastembed) causes vector dimension mismatch.\nIf you switch Embedding backend, you MUST run `rm -rf data/chroma` to clear old memory!",
+        "warn_text": "⚠️ Warning: Switching inference models (Ollama ↔ Cloud) does not lose memory.\nAll modes use fastembed for local memory retrieval.",
         "frame_backend": "1. Select Inference Backend",
         "radio_ollama": "Ollama (Recommended, Auto local deploy)",
         "radio_cloud": "Cloud API (Lightweight, fastembed for local memory)",
@@ -113,6 +113,10 @@ class InstallWizard:
         self.gguf_planner = None
         self.gguf_router = None
         self.current_lang = "zh" 
+        
+        # 👇 关键修复 1：强制使用 clam 主题，解决 Mac 上按钮颜色变白和下拉框隐身的问题
+        style = ttk.Style()
+        style.theme_use('clam')
         
         self._build_ui()
         self._apply_language()
@@ -190,8 +194,14 @@ class InstallWizard:
         self.log_text = scrolledtext.ScrolledText(self.root, height=8, state="disabled", bg="#1e1e1e", fg="#d4d4d4")
         self.log_text.pack(fill="both", expand=True, pady=10)
 
-        self.btn_install = tk.Button(self.root, text="", bg="#0969da", fg="white", font=("Arial", 12, "bold"), command=self.start_install)
-        self.btn_install.pack(pady=5)
+        # 👇 关键修复 2：改用 ttk.Button 并配合 clam 主题，彻底解决 Mac 按钮变白看不见字的问题
+        self.btn_install = ttk.Button(self.root, text="", style="Accent.TButton", command=self.start_install)
+        self.btn_install.pack(pady=5, fill="x")
+        
+        # 配置一下 ttk.Button 的样式（蓝色底，白色字）
+        style = ttk.Style()
+        style.configure("Accent.TButton", font=("Arial", 12, "bold"), foreground="white", background="#0969da")
+        style.map("Accent.TButton", background=[('active', '#0757b3'), ('disabled', '#a0c4f1')])
 
     def _on_lang_change(self, event):
         self.current_lang = "zh" if self.lang_combo.current() == 0 else "en"
@@ -236,19 +246,16 @@ class InstallWizard:
 
     def _toggle_mode(self):
         mode = self.mode_var.get()
-        # 隐藏所有配置区
         self.frame_ollama.pack_forget()
         self.frame_cloud.pack_forget()
         self.frame_agent_lang.pack_forget()
 
-        # 根据模式显示配置
         if mode == "ollama":
             self.frame_ollama.pack(fill="x")
             self._toggle_ollama_source()
         else:
             self.frame_cloud.pack(fill="x")
             
-        # Agent 语言配置一直显示在最后
         self.frame_agent_lang.pack(fill="x", pady=(10, 0))
 
     def _toggle_ollama_source(self):
@@ -304,10 +311,8 @@ class InstallWizard:
             mode = self.mode_var.get()
             env_file = os.path.join(self.base_dir, ".env")
             
-            # 无论哪种模式，写入 Agent 语言
             lang_config = f"AGENT_LANG={self.agent_lang_var.get()}\n"
 
-            # ================= 1. 生成 .env 与 模型准备 =================
             if mode == "ollama":
                 self.log(t["log_ollama_prep"])
                 if shutil.which("ollama") is None:
@@ -316,7 +321,7 @@ class InstallWizard:
                     subprocess.run(["sh", "/tmp/ollama.sh"], check=True)
                     self.log(t["log_ollama_done"])
 
-                self._pull_model("bge-m3")
+                # 不再拉取 bge-m3，统一用 fastembed
                 
                 if self.ollama_source.get() == "import":
                     if not self.gguf_planner or not self.gguf_router:
@@ -343,10 +348,11 @@ class InstallWizard:
 
                 with open(env_file, "w", encoding="utf-8") as f:
                     f.write(lang_config)
-                    f.write("AGENT_LLM_BACKEND=ollama\nAGENT_ROUTER_BACKEND=ollama\n")
+                    f.write("AGENT_LLM_BACKEND=ollama\n")
+                    f.write("AGENT_ROUTER_BACKEND=ollama\n")
                     f.write("OLLAMA_URL=http://localhost:11434\n")
                     f.write(f"PLANNER_MODEL={planner_name}\nROUTER_MODEL={router_name}\n")
-                    f.write("EMBED_BACKEND=ollama\nEMBED_MODEL=bge-m3\n")
+                    f.write("EMBED_BACKEND=fastembed\n") # 统一锁死 fastembed
 
             elif mode == "cloud":
                 self.log(t["log_cloud_prep"])
@@ -359,7 +365,6 @@ class InstallWizard:
                     f.write("EMBED_BACKEND=fastembed\n")
                 self.log(t["log_cloud_done"])
 
-            # ================= 2. 建虚拟环境 =================
             self.log(t["log_venv"])
             venv_dir = os.path.join(self.base_dir, ".venv")
             if os.path.exists(venv_dir):
@@ -368,37 +373,34 @@ class InstallWizard:
             
             pip_bin = os.path.join(venv_dir, "Scripts", "pip.exe") if sys.platform == "win32" else os.path.join(venv_dir, "bin", "pip")
             
-            # ================= 3. 安装依赖 =================
             self.log(t["log_deps"])
             subprocess.run([pip_bin, "install", "-r", "requirements.txt"], check=True)
 
-            # ================= 4. 自动下载 Playwright 浏览器 =================
             self.log(t["log_playwright"])
             python_bin = os.path.join(venv_dir, "Scripts", "python.exe") if sys.platform == "win32" else os.path.join(venv_dir, "bin", "python3")
             subprocess.run([python_bin, "-m", "playwright", "install", "chromium"], check=True)
             self.log(t["log_playwright_done"])
             
-            # 如果选了云端，预热下载一下向量模型
-            if mode == "cloud":
-                self.log(t["log_fastembed"])
-                test_script = "from fastembed import TextEmbedding; list(TextEmbedding('BAAI/bge-small-zh-v1.5').embed(['test']))"
-                subprocess.run([python_bin, "-c", test_script], check=True)
-                self.log(t["log_fastembed_done"])
+            # 无论什么模式，都预下载 fastembed
+            self.log(t["log_fastembed"])
+            test_script = "from fastembed import TextEmbedding; list(TextEmbedding('BAAI/bge-small-zh-v1.5').embed(['test']))"
+            subprocess.run([python_bin, "-c", test_script], check=True)
+            self.log(t["log_fastembed_done"])
 
-            # ================= 5. 初始化目录 =================
             self.log(t["log_init"])
             for d in ["data/chroma", "logs", "skills"]:
                 os.makedirs(os.path.join(self.base_dir, d), exist_ok=True)
 
             self.log(t["log_finish"])
-            self.root.after(0, lambda: self.btn_install.config(state="normal", text=t["btn_done"], bg="#1a7f37"))
+            self.root.after(0, lambda: self.btn_install.config(state="normal", text=t["btn_done"]))
             self.root.after(0, lambda: messagebox.showinfo(t["msg_success_title"], t["msg_success_text"]))
 
         except Exception as e:
-            err_msg = str(e)  # 提前转字符串
+            err_msg = str(e)
             self.log(f"\n❌ 错误: {err_msg}")
-            self.root.after(0, lambda msg=err_msg: self.btn_install.config(state="normal", text="❌ 失败", bg="#cf222e"))
+            self.root.after(0, lambda msg=err_msg: self.btn_install.config(state="normal", text="❌ 失败"))
             self.root.after(0, lambda msg=err_msg: messagebox.showerror("安装失败", msg))
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = InstallWizard(root)
