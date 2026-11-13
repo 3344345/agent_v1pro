@@ -19,7 +19,7 @@ from config import (
     ENABLE_PREFERENCE_MEMORY, MEMORY_TOP_K, MEMORY_MIN_SCORE, OUTPUT_DIR,
     SIMILARITY_WINDOW_SIZE, SIMILARITY_ARGS_THRESHOLD, SIMILARITY_OUT_THRESHOLD,
     MAX_REFLECT_COUNT, RAG_INTERVENE_TOP_K, RAG_INTERVENE_MIN_SCORE,
-    PLANNING_KEYWORDS, REFLECT_CONTINUE_FLAG, REFLECT_STOP_FLAG,SIGNATURE_DUP_THRESHOLD
+    PLANNING_KEYWORDS, REFLECT_CONTINUE_FLAG, REFLECT_STOP_FLAG, SIGNATURE_DUP_THRESHOLD
 )
 from prompts import AGENT_SYSTEM_PROMPT, REFLECT_PROMPT_TEMPLATE
 from core.llm import call_planner, reset_backend
@@ -38,6 +38,10 @@ from runtime.stop_token import StopException
 from preflight import run_preflight, format_issues
 from core import browser
 from runtime.stop_token import get_current
+
+# 引入护栏引擎
+from core.guardrails import GuardrailEngine
+from core.guardrails.builtins import ToolFailureGuardrail, SemanticDuplicateGuardrail
 
 
 def chat_with_planner(messages):
@@ -204,7 +208,6 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
 
     log_event("info", f"agent 启动: hint={hint} max_attempts={MAX_ATTEMPTS} summary={intent_summary[:50]}", stage="tool_call")
 
-    # 👇 1. 调用工厂：获取上下文和已注入的 Skill ID
     system_content, injected_skill_ids = build_agent_context(
         store=get_store(),
         user_input=user_input,
@@ -230,10 +233,14 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
     last_args = None
     tool_history = []
     final_content = None
-    failure_counts = {}
     stuck_reason = None
     total_reflect_count = 0 
-    recent_actions = deque(maxlen=SIMILARITY_WINDOW_SIZE)
+    
+    # ================= 初始化护栏引擎 =================
+    guard_engine = GuardrailEngine()
+    guard_engine.register(ToolFailureGuardrail())
+    guard_engine.register(SemanticDuplicateGuardrail())
+    # ==================================================
 
     for step in range(1, MAX_ATTEMPTS + 1):
         if stop_token is not None: stop_token.check()
@@ -277,10 +284,8 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
             except Exception as e:
                 log_event("error", f"参数解析失败: {args_data} - {e}", stage="tool_call")
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", "unknown"), "content": f"参数解析失败: {e}"})
-                failure_counts[func_name] = failure_counts.get(func_name, 0) + 1
                 continue
 
-            current_args_str = json.dumps(func_args, sort_keys=True, ensure_ascii=False)
             log_event("info", f"执行工具: {func_name}, 参数: {func_args}", stage="tool_call", extra={"tool": func_name, "args": func_args})
             
             output = registry.execute(func_name, func_args)
@@ -299,30 +304,17 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
             last_args = func_args
             tool_history.append({"tool": func_name, "args": func_args})
 
-            if _is_tool_failure(output):
-                failure_counts[func_name] = failure_counts.get(func_name, 0) + 1
-            else:
-                failure_counts[func_name] = 0
-
-            hit_loop = False
-            similar_count = 0  # 👈 新增：记录相似的次数
+            # ================= 核心：运行护栏引擎 =================
+            # 这里把原来的 if hit_loop or failure_counts... 统一交给了 guard_engine
+            triggered = guard_engine.check(
+                messages=messages, 
+                tool_name=func_name, 
+                tool_args=func_args, 
+                output=output, 
+                history=tool_history
+            )
             
-            for prev_tool, prev_args_str, prev_out in recent_actions:
-                if prev_tool == func_name:
-                    sim_args = difflib.SequenceMatcher(None, current_args_str, prev_args_str).ratio()
-                    sim_out = difflib.SequenceMatcher(None, output, prev_out).ratio()
-                    
-                    if sim_args > SIMILARITY_ARGS_THRESHOLD or sim_out > SIMILARITY_OUT_THRESHOLD:
-                        similar_count += 1  # 👈 找到一个相似的，不立刻退出，而是计数
-            
-            # 👈 核心逻辑：只有当相似次数达到 SIGNATURE_DUP_THRESHOLD（你配的 3）时才熔断
-            if similar_count >= SIGNATURE_DUP_THRESHOLD:
-                hit_loop = True
-                log_event("warning", f"工具 {func_name} 触发相似度熔断 (窗口内相似 {similar_count} 次)", stage="tool_call")
-            
-            recent_actions.append((func_name, current_args_str, output))
-
-            if hit_loop or failure_counts.get(func_name, 0) >= TOOL_FAIL_INTERVENE_THRESHOLD:
+            if triggered:
                 total_reflect_count += 1
                 
                 if total_reflect_count >= MAX_REFLECT_COUNT:
@@ -330,8 +322,7 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                     stuck_reason = f"连续触发 {total_reflect_count} 次死循环反思，系统判定无解"
                     break
 
-                log_event("warning", f"触发阶段反思 (第 {total_reflect_count} 次, 失败次数:{failure_counts.get(func_name, 0)}, 相似度死循环:{hit_loop})", stage="memory")
-                
+                # 构建阶段反思的 Prompt
                 messages.append({
                     "role": "user",
                     "content": (
@@ -343,7 +334,8 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                 
                 reflect_res = call_planner(messages, tools=None, retry=True, log_fn=log_event)
                 if "error" in reflect_res:
-                    failure_counts[func_name] = 0
+                    # 如果反思调用失败，跳过本轮反思，重置状态继续
+                    guard_engine.state.clear()
                     continue
                     
                 reflect_text = reflect_res.get("message", {}).get("content", "")
@@ -355,6 +347,7 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                     final_content = f"任务被终止。反思结论：{reflect_text.replace(REFLECT_STOP_FLAG, '').strip()}"
                     break 
                 
+                # 执行 RAG 注入
                 rag_hint = ""
                 try:
                     search_query = f"任务上下文: {focus_ctx[:100] if focus_ctx else ''}\n"
@@ -369,7 +362,6 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                         min_score=RAG_INTERVENE_MIN_SCORE
                     )
                     
-                    # 👇 核心：过滤已注入的 Skill，防止重复投喂
                     filtered_relevant = []
                     for r in all_relevant:
                         if r.get("category") == "skill":
@@ -399,17 +391,15 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                     )
                 })
                 
-                failure_counts[func_name] = 0
-                recent_actions.clear()
+                # 触发干预后，清空护栏状态（重置计数和相似度窗口）
+                guard_engine.state.clear()
+                # 由于我们在护栏里修改了 messages，需要 break 出当前 tool_calls 循环
+                # 让模型在下一轮读取新的系统干预信息
+                break 
+            # ======================================================
 
         if stuck_reason or final_content: 
             break
-
-        for name, count in failure_counts.items():
-            if count >= FAILURE_THRESHOLD:
-                stuck_reason = f"工具 {name} 连续失败 {count} 次"
-                break
-        if stuck_reason: break
 
     if stuck_reason:
         log_event("warning", f"检测到卡死，停止尝试：{stuck_reason}", stage="tool_call", event="agent.stuck", extra={"reason": stuck_reason})
@@ -428,7 +418,7 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
 
     return final_content, last_tool, last_args, tool_history
 
-
+# 后面的 _read_user_input, _busy_loop, handle_input, main 等保持你原来的代码不变
 def _read_user_input() -> str:
     line = input("> ")
     parts = [line]
@@ -581,6 +571,7 @@ def main():
             continue
 
         _busy_loop(runtime)
+
 
 if __name__ == "__main__":
     main()
