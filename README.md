@@ -6,30 +6,27 @@
 
 ## English
 
-A local-first, multi-backend AI Agent runtime exploring long-term memory, self-correction, and basic guardrails for local small language models.
+A pragmatic, local-first AI Agent runtime built specifically for small language models (7B/9B). We don't build a magic AGI; we build robust engineering guardrails to help small models survive in real-world tasks.
 
-### ✨ Features
+> **⚠️ A Note on Honesty:** This is an experimental, architecture-focused open-source project, not a commercial product. It does not have kernel-level sandboxing, multi-agent swarms, or a plugin marketplace. It is a **single-process, highly decoupled** runtime.
 
-- **Multi-Backend Support**: Supports switching between local deployment via **Ollama**, native **llama.cpp**, and pure **Cloud API** (e.g., DeepSeek).
-- **Lightweight Memory**: Cloud mode optionally uses `fastembed` for local vector retrieval, eliminating the dependency on deploying a local Ollama instance for memory features.
-- **Logs as History**: Simplifies the architecture by extracting action sequences directly from JSONL logs instead of maintaining redundant database tables.
-- **Cross-Platform**: Initial adaptations for Linux, macOS, and Windows, including a basic graphical installation wizard.
-- **Guardrails & Interventions**: Includes basic context shrinking, tool failure interventions, and prompt constraints to mitigate memory pollution and infinite loops.
+### ✨ Core Features & Architecture
 
-### ⚠️ Critical Warning: Embedding Dimension Conflict
+| Feature | Description |
+| :--- | :--- |
+| **Pure Atomic Tools** | Instead of writing dozens of format-specific plugins, we only provide `execute_python`, `execute_command`, `browser`, and `web_search`. The model is forced to compose its own logic. |
+| **Decoupled LLM Backends** | The LLM factory pattern allows seamless switching between **Ollama**, native **llama.cpp**, and **Cloud APIs** (e.g., DeepSeek) without changing business logic. |
+| **Dynamic RAG Memory** | Uses `fastembed` (pure Python, CPU-only) and ChromaDB for semantic retrieval. **Zero dimension conflicts.** We inject relevant knowledge only when the model needs it. |
+| **Policy-Driven Guardrails** | Instead of hardcoded `if-else` blocks, we use a Strategy Pattern (`GuardrailEngine`) to intercept deadlocks, tool failures, and infinite loops. |
+| **Local-First & Lightweight** | Runs entirely on your local machine. No mandatory Docker, no heavy external dependencies for memory vectorization. |
 
-This system uses ChromaDB for long-term memory. **Switching the `EMBED_BACKEND` will cause a vector dimension mismatch!**
-- **Ollama** (`bge-m3`) produces 1024-dim vectors.
-- **Cloud / fastembed** produces 512-dim vectors.
-
-If you must switch between these backends, you **MUST** clear the old memory database first:
-```bash
-rm -rf data/chroma
-```
+### 🧩 System Coupling & Design Philosophy
+- **Decoupled OS Layer**: `core/sys_utils.py` abstracts cross-platform process management (`setsid` vs `taskkill`).
+- **Decoupled Memory Layer**: SQLite for structural storage + ChromaDB for vector search, unified behind a `MemoryStore` interface.
+- **Safety by Design**: Out-of-the-box blacklist interception for dangerous commands (`rm -rf /`, `curl | bash`) and strict `<untrusted_data>` encapsulation for all web scraping.
+- **Graceful Degradation**: If the small model hallucinates or gets stuck in a loop, the `GuardrailEngine` will forcefully inject corrective prompts or terminate the task, rather than burning your GPU.
 
 ### 🚀 Quick Start
-
-#### 1. One-Line Install (Recommended)
 
 **For macOS / Linux:**
 ```bash
@@ -40,99 +37,49 @@ curl -fsSL https://raw.githubusercontent.com/3344345/agent_v1pro/main/install.sh
 ```powershell
 powershell -Command "iwr -usefl https://raw.githubusercontent.com/3344345/agent_v1pro/main/install.bat -OutFile $env:TEMP\install.bat; & $env:TEMP\install.bat"
 ```
-*The wizard will automatically handle the environment, dependencies, and guide you through backend selection.*
 
-#### 2. Manual Installation
-```bash
-git clone https://github.com/3344345/agent_v1pro.git
-cd agent_v1pro
-
-# macOS / Linux
-chmod +x install.sh
-./install.sh
-
-# Windows
-# Double-click install.bat or run it in cmd
-```
-
-#### 3. Start the Agent
-```bash
-./run.sh
-```
-
-### 🛠️ Maintenance
-
-Manage your memory (list, search, delete):
-```bash
-source .venv/bin/activate
-python scripts/memory_admin.py list
-```
+### ⚠️ Current Limitations (What we haven't solved yet)
+- **No True Concurrency**: It operates in a single-process worker model. While it queues tasks, it does not support true multi-tenant parallel execution (due to local VRAM constraints).
+- **No Kernel Sandboxing**: Security is enforced at the command-line regex and tool-execution level. It is not a Docker/KVM sandbox.
+- **Limited Multi-agent Capabilities**: Currently focused on a single, powerful assistant rather than orchestrating multiple sub-agents.
 
 ---
 
 ## 简体中文
 
-一个本地优先、多后端支持的 AI Agent 运行时，主要探索本地小模型在长期记忆、自我纠错和基础防线上的工程化落地。
+一个务实、本地优先的 AI Agent 运行时，专为小模型（7B/9B）设计。我们不造 AGI 的梦，我们只做工程化的防呆机制，让小模型能在真实任务中活下来。
 
-### ✨ 核心特性
+> **⚠️ 诚实声明**：这是一个专注于架构设计的实验性开源项目，并非商业级产品。它没有内核级沙箱、没有多智能体集群、没有插件市场。它是一个**单进程、高度解耦**的轻量级运行时。
 
-- **多后端引擎**：支持在 **Ollama** 本地部署、原生 **llama.cpp** 以及纯 **云端 API**（如 DeepSeek）之间切换。
-- **轻量化记忆**：云端模式下可选择使用 `fastembed` 进行本地向量检索，省去了为了记忆功能而额外部署本地 Ollama 的麻烦。
-- **日志即历史**：简化架构，直接从 JSONL 日志中提取动作序列作为上下文，去除了多余的流水表依赖。
-- **跨平台兼容**：对 Linux、macOS 与 Windows 做了初步适配，并提供了基础的图形化配置向导。
-- **基础防呆机制**：内置了基础的上下文压缩、工具失败干预与反思约束，用于缓解记忆污染和死循环问题。
+### ✨ 核心特性与架构设计
 
-### ⚠️ 重要警告：向量维度冲突
+| 特性 | 描述 |
+| :--- | :--- |
+| **纯原子工具** | 拒绝“胶水代码”。我们只提供 `execute_python`、`execute_command` 等最基础的触手，逼迫模型自己写代码，而不是依赖大量死板的专用工具。 |
+| **多后端解耦** | 依赖工厂模式，可以在 **Ollama**、原生 **llama.cpp** 和 **云端 API**（如 DeepSeek）之间无缝切换，业务代码零修改。 |
+| **动态 RAG 记忆** | 彻底抛弃复杂的 Ollama 向量依赖，全量采用 `fastembed`（纯 CPU、轻量、512维）。**彻底解决维度冲突问题**。按需注入，不污染上下文。 |
+| **策略型护栏 (Guardrails)** | 抛弃在主循环里写死 `if-else`，重构为策略模式。防死循环、防连续失败、静默知识注入全由独立的护栏类接管。 |
+| **本地优先与极简** | 数据完全不离开本地。不需要额外部署重型向量库，Python 环境一键拉起。 |
 
-本系统使用 ChromaDB 存储长期记忆。**切换 `EMBED_BACKEND` 会导致向量维度不匹配直接崩溃！**
-- **Ollama** (`bge-m3`) 产生 1024 维向量。
-- **云端 / fastembed** 产生 512 维向量。
-
-如果你必须在两套引擎间切换，请**务必**在终端执行以下命令清空旧记忆库：
-```bash
-rm -rf data/chroma
-```
+### 🧩 系统解耦程度与设计哲学
+- **操作系统层解耦**：`core/sys_utils.py` 完美抹平了 Linux 与 Windows 在进程组强杀上的差异。
+- **存储层解耦**：SQLite 存正文，ChromaDB 存向量，对外暴露统一的 `MemoryStore` 接口。
+- **设计级安全**：内置高危命令黑名单拦截，且对所有外部抓取的网页数据强制包裹 `<untrusted_data>`，防止提示词注入。
+- **优雅降级**：如果小模型陷入死循环，护栏引擎会强制注入纠偏提示词，或者直接强行终止任务，保护你的显存不被烧干。
 
 ### 🚀 极简安装
-
-#### 1. 一行命令安装（推荐）
 
 **macOS / Linux 用户：**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/3344345/agent_v1pro/main/install.sh | bash
 ```
 
-**Windows 用户（打开 PowerShell）：**
+**Windows 用户（PowerShell）：**
 ```powershell
 powershell -Command "iwr -usefl https://raw.githubusercontent.com/3344345/agent_v1pro/main/install.bat -OutFile $env:TEMP\install.bat; & $env:TEMP\install.bat"
 ```
-*安装向导会自动处理 Python 环境、依赖包，并弹出窗口让你选择后端和下载模型。*
 
-#### 2. 手动克隆安装
-```bash
-git clone https://github.com/3344345/agent_v1pro.git
-cd agent_v1pro
-
-# macOS / Linux 用户
-chmod +x install.sh
-./install.sh
-
-# Windows 用户
-# 直接双击运行 install.bat 即可
-```
-
-#### 3. 启动 Agent
-```bash
-./run.sh
-```
-
-### 🛠️ 记忆维护
-
-查看、搜索或删除记忆库中的条目：
-```bash
-source .venv/bin/activate
-python scripts/memory_admin.py list
-```
-
----
-*Powered by the philosophy of "Pure Atomic Tools" and "Logs as History".*
+### ⚠️ 已知限制（我们尚未解决的问题）
+- **并非真正的并发**：目前是单 Worker 排队模式。受限于本地显存，无法像云端服务那样高并发处理请求。
+- **无内核级沙箱**：安全依赖命令正则拦截和执行器隔离，并非完整的 Docker/KVM 沙箱。
+- **非多智能体系统**：目前专注于打造单一强力助手，暂不支持多 Agent 通讯编排。
