@@ -50,3 +50,7 @@ chroma/
 *.swo
 .DS_Store
 Thumbs.db
+# ================= 网页端运行时产物 =================
+web/static/uploads/
+web/static/*.bak-*
+runtime/web.pid
