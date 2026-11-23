@@ -8,8 +8,10 @@ from config import (
     LLM_BACKEND, ROUTER_BACKEND,
     ROUTER_MODEL, ROUTER_OPTIONS,
     PLANNER_MODEL, PLANNER_OPTIONS,
+    PROMPT_BUDGET_TOKENS,
 )
 from core.llm.base import LLMBackend
+from core.context_budget import fit_messages, estimate_messages_tokens
 from logger import log_event
 
 
@@ -114,6 +116,15 @@ def call_planner(messages, tools=None, retry=True, log_fn=None):
             log_fn(level, msg, stage="llm", extra=extra)
         else:
             log_event(level, msg, stage="llm", extra=extra)
+
+    # budget 是整组 prompt 的总预算；system 已在 main.py 按 SYSTEM_BUDGET_TOKENS 单独压过
+    budget = PROMPT_BUDGET_TOKENS
+    before = estimate_messages_tokens(messages)
+    messages = fit_messages(messages, budget)
+    after = estimate_messages_tokens(messages)
+    if after < before:
+        _log("warning", f"上下文超预算，已压缩 {before} → {after} tokens（预算 {budget}）",
+             {"event": "agent.ctx_shrink"})
 
     backend = get_backend()
     

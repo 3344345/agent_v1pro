@@ -53,7 +53,9 @@ class AgentRuntime:
         }
 
     def is_busy(self) -> bool:
-        return self._worker is not None and self._worker.is_alive()
+        """worker 槽位被占用即为忙。槽位在状态回 IDLE 之后才释放，
+        因此 is_busy()==False 时状态必然是 IDLE，前端不会看到"空闲但状态未归位"。"""
+        return self._worker is not None
 
     def _set_state(self, new_state: AgentState):
         with self._state_lock:
@@ -99,25 +101,30 @@ class AgentRuntime:
                           stage="runtime", event="subscriber.error")
 
     # ---------- 提交 ----------
-    def submit(self, user_input: str):
-        """同步提交（阻塞到任务结束），测试用"""
-        self._run(user_input)
+    def submit_async(self, user_input: str, images=None) -> bool:
+        """异步提交，立刻返回。返回 False 表示拒绝（任务已在跑）。images 为图片路径列表。
 
-    def submit_async(self, user_input: str) -> bool:
-        """异步提交，立刻返回。返回 False 表示拒绝（任务已在跑）。"""
-        if self.is_busy():
+        准入判定与 worker 槽位分配在同一把锁内完成，杜绝"放行后又被静默丢弃"的窗口。
+        """
+        with self._state_lock:
+            if self._state != AgentState.IDLE or self._worker is not None:
+                rejected_state = self._state.value
+            else:
+                rejected_state = None
+                self._worker = threading.Thread(
+                    target=self._run,
+                    args=(user_input, images),
+                    daemon=True,
+                    name="agent-worker",
+                )
+                self._worker.start()
+
+        # 日志一律在锁外写：logger 有 IO，锁内写会拖住整个状态机
+        if rejected_state is not None:
             log_event("warning",
-                      "已有任务在运行，拒绝新输入",
+                      f"当前状态 {rejected_state}，拒绝新输入",
                       stage="runtime", event="submit.rejected")
             return False
-
-        self._worker = threading.Thread(
-            target=self._run,
-            args=(user_input,),
-            daemon=True,
-            name="agent-worker",
-        )
-        self._worker.start()
         return True
 
     def stop(self) -> bool:
@@ -130,13 +137,9 @@ class AgentRuntime:
         return True
 
     # ---------- 内部：工作线程入口 ----------
-    def _run(self, user_input: str):
+    def _run(self, user_input: str, images=None):
+        # 准入已在 submit_async 的锁内完成，这里只做初始化
         with self._state_lock:
-            if self._state != AgentState.IDLE:
-                log_event("warning",
-                          f"当前状态 {self._state.value}，忽略新输入",
-                          stage="runtime", event="submit.rejected")
-                return
             self._stop_token = StopToken()
 
         # 让 executor 能通过 get_current() 拿到
@@ -157,7 +160,7 @@ class AgentRuntime:
             ))
 
             self._set_state(AgentState.RUNNING)
-            self._handler(user_input, self)
+            self._handler(user_input, self, images=images)
 
             stopped = self._stop_token.is_stopped()
         except StopException:
@@ -180,9 +183,6 @@ class AgentRuntime:
                 self._set_state(AgentState.ERROR)
         finally:
             set_current(None)
-            with self._state_lock:
-                self._stop_token = None
-                self._worker = None
 
         # 状态收尾（在锁外做，避免死锁）
         current_state = self.state
@@ -191,7 +191,7 @@ class AgentRuntime:
                 self._set_state(AgentState.CANCELLED)
             else:
                 self._set_state(AgentState.DONE)
-                
+
             self._broadcast(Event(
                 type=EVENT_AGENT_FINISHED,
                 payload={"status": "stopped" if stopped else "done"},
@@ -199,3 +199,10 @@ class AgentRuntime:
             self._set_state(AgentState.IDLE)
         elif current_state == AgentState.ERROR:
             self._set_state(AgentState.IDLE)
+
+        # 释放 worker 槽位。is_busy() 以槽位为准，而槽位只在状态已回 IDLE 后才清空，
+        # 因此外部永远看不到"状态已 IDLE 但 is_busy() 仍为 True"的中间态。
+        # 注意：这里只做赋值，绝不调用 _set_state（它会再取同一把非重入锁 → 自锁）。
+        with self._state_lock:
+            self._stop_token = None
+            self._worker = None

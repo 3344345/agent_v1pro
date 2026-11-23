@@ -7,6 +7,7 @@ from registries.tool_registry import register
 from core.executor import execute_command as _exec
 from runtime.stop_token import get_current
 from logger import log_event
+from config import MAX_OUTPUT_CHARS
 
 
 def _has_display() -> bool:
@@ -108,7 +109,7 @@ def execute_command(command: str) -> str:
     if result.success:
         msg = f"✅ 命令执行成功（退出码 {result.exit_code}）"
         if result.stdout:
-            msg += f"\n输出:\n{result.stdout[:1500]}"
+            msg += f"\n输出:\n{result.stdout[:MAX_OUTPUT_CHARS]}"
         if result.created_files:
             msg += f"\n创建了 {len(result.created_files)} 个文件: {', '.join(result.created_files[:5])}"
         if result.modified_files:
@@ -117,5 +118,5 @@ def execute_command(command: str) -> str:
     else:
         msg = f"❌ 命令执行失败（退出码 {result.exit_code}）"
         if result.stderr:
-            msg += f"\n错误: {result.stderr[:1000]}"
+            msg += f"\n错误: {result.stderr[:MAX_OUTPUT_CHARS // 4]}"
         return msg

@@ -107,15 +107,17 @@ def parse_router_output(text: str) -> dict:
 
 
 # ========== 对外接口 ==========
-def route(user_input: str, log_fn=None) -> dict:
+def route(user_input: str, log_fn=None, has_images: bool = False) -> dict:
     def _log(level, msg, extra=None):
         if log_fn:
             log_fn(level, msg, stage="route", extra=extra)
 
-    if not user_input or not user_input.strip():
+    if (not user_input or not user_input.strip()) and not has_images:
         return {"ok": False, "error": "空输入"}
 
-    prompt = build_router_prompt(user_input.strip())
+    # 纯图片输入时给路由一个占位描述，避免空 prompt
+    _route_text = (user_input or "").strip() or "[用户发送了图片，未附带文字]"
+    prompt = build_router_prompt(_route_text)
     messages = [{"role": "user", "content": prompt}]
 
     result = call_router(messages)

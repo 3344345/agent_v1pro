@@ -237,6 +237,7 @@ class LlamaCppServerBackend(LLMBackend):
                       extra={"profile": self.profile, "error": str(e)})
             return False
 
+
     # ---------- 核心接口 ----------
     def chat(self, model, messages, tools=None, options=None, timeout=None) -> dict:
         # ========== 健康探测：失联则重启 ==========
@@ -249,7 +250,7 @@ class LlamaCppServerBackend(LLMBackend):
 
         payload = {
             "model": model or "local",
-            "messages": messages,
+            "messages": _sanitize_messages(messages),
             "stream": False,
         }
         if "temperature" in opts:
@@ -378,3 +379,26 @@ class LlamaCppServerBackend(LLMBackend):
         except Exception:
             pass
         self._shutdown()
+
+
+def _sanitize_messages(messages):
+    """本地 llama.cpp / 9B 不认云端专有字段，发送前统一清洗：
+       1) 剔除 reasoning_content（云端思考模式产物，本地会 500）
+       2) role=tool 缺 tool_call_id 时按序回填，避免本地模板渲染报错
+       3) content=None 归一为 ""
+    """
+    out, pending = [], []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        msg = {k: v for k, v in m.items() if k != "reasoning_content"}
+        if msg.get("content") is None:
+            msg["content"] = ""
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            pending = [t.get("id") for t in msg["tool_calls"]
+                       if isinstance(t, dict) and t.get("id")]
+        elif role == "tool" and not msg.get("tool_call_id") and pending:
+            msg["tool_call_id"] = pending.pop(0)
+        out.append(msg)
+    return out

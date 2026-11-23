@@ -9,11 +9,13 @@ from collections import deque
 from datetime import datetime
 import difflib
 
+from core.context_budget import estimate_tokens, fit_system, fit_messages
+from core.vision import prepare_images, build_user_content, vision_supported
 from config import (
     LOG_FILE, MAX_ATTEMPTS, FAILURE_THRESHOLD,
     HISTORY_LIMIT, COMPRESS_KEEP_RECENT, COMPRESS_MAX_CHARS, ENABLE_LOG_ROTATION,
-    MAX_SYS_CHARS, MAX_OUTPUT_CHARS, SHRINK_KEEP_HEAD, SHRINK_KEEP_TAIL,
-    SHRINK_MAX_CHARS, SHRINK_MIN_CHARS,
+    MAX_OUTPUT_CHARS, SHRINK_KEEP_HEAD, SHRINK_KEEP_TAIL,
+    SHRINK_MAX_CHARS, SHRINK_MIN_CHARS, SYSTEM_BUDGET_TOKENS, PROMPT_BUDGET_TOKENS,
     TOOL_FAIL_INTERVENE_THRESHOLD,
     REFLECT_MAX_LEN, REFLECT_CAUSAL_WORDS, DIALOGUE_KEYWORDS,
     ENABLE_PREFERENCE_MEMORY, MEMORY_TOP_K, MEMORY_MIN_SCORE, OUTPUT_DIR,
@@ -44,7 +46,14 @@ from core.guardrails import GuardrailEngine
 from core.guardrails.builtins import ToolFailureGuardrail, SemanticDuplicateGuardrail
 
 
-def chat_with_planner(messages):
+def chat_with_planner(messages, images=None):
+    if images:
+        # 把最后一条 user 消息替换为多模态内容
+        messages = list(messages)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                messages[i] = {"role": "user", "content": _build_user_content(messages[i].get("content") or "", images)}
+                break
     result = call_planner(messages, tools=None, retry=True, log_fn=log_event)
     if "error" in result:
         stage = result.get("stage", "unknown")
@@ -71,6 +80,8 @@ def _is_tool_failure(output: str) -> bool:
     return any(m in output for m in fail_markers)
 
 
+# [已废弃] 仅保留作参考。主循环已改用 core.context_budget.fit_messages 做 token 级预算裁剪。
+# 旧实现只截断中间 tool 消息内容、不减少消息条数，长任务下 prompt 会无限增长。
 def _shrink_messages(messages):
     if len(messages) <= SHRINK_KEEP_HEAD + SHRINK_KEEP_TAIL:
         return messages
@@ -199,12 +210,53 @@ def _summarize_session():
         log_event("warning", f"会话总结失败: {e}", stage="memory")
 
 
-def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=None):
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+def _extract_images(user_input, images=None):
+    """从文本中提取图片路径（支持 @路径 与裸路径），返回 (清理后文本, 图片列表)。"""
+    import re as _re
+    found = list(images) if images else []
+    def _take(m):
+        path = m.group(1).strip().strip('"').strip("'")
+        if os.path.exists(path) and path.lower().endswith(_IMG_EXTS):
+            found.append(path)
+            return ""
+        return m.group(0)
+    # 1) 引号包裹的路径（可含空格）
+    text = _re.sub(r'["\']([^"\']+\.(?:png|jpg|jpeg|webp|gif|bmp))["\']', _take, user_input, flags=_re.I)
+    # 2) @路径（可含空格，贪婪到扩展名结尾）
+    text = _re.sub(r"@([^\n]*?\.(?:png|jpg|jpeg|webp|gif|bmp))", _take, text, flags=_re.I)
+    # 3) 裸路径：从路径分隔符起贪婪匹配到扩展名结尾，兼容空格
+    text = _re.sub(r"((?:~|/|\.{1,2}/)[^\n]*?\.(?:png|jpg|jpeg|webp|gif|bmp))", _take, text, flags=_re.I)
+    text = text.strip()
+    if found:
+        log_event("info", f"检测到 {len(found)} 张图片输入", stage="vision")
+    return text, (found or None)
+
+
+def _build_user_content(user_input, images):
+    """把图片组装进 user content。无图时原样返回字符串，零改动兼容旧逻辑。"""
+    if not images:
+        return user_input
+    try:
+        blocks, warnings, degrade = prepare_images(images)
+        if warnings:
+            for w in warnings:
+                log_event("warning", f"图片处理: {w}", stage="vision")
+        if degrade:
+            log_event("warning", f"图片降级: {degrade}", stage="vision")
+        return build_user_content(user_input, blocks, notice=degrade or "")
+    except Exception as e:
+        log_event("error", f"图片组装失败，降级为纯文本: {e}", stage="vision")
+        return user_input
+
+
+def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=None, images=None):
     all_schemas = registry.get_schemas()
     if not all_schemas:
         log_event("warning", "无可用工具", stage="tool_call")
         print("⚠️ 无可用工具\n")
-        return None, None, None, []
+        return "⚠️ 当前没有可用工具，无法执行该任务。请检查工具注册配置后重试。", None, None, []
 
     log_event("info", f"agent 启动: hint={hint} max_attempts={MAX_ATTEMPTS} summary={intent_summary[:50]}", stage="tool_call")
 
@@ -218,15 +270,18 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
         base_system_prompt=AGENT_SYSTEM_PROMPT
     )
     
-    if len(system_content) > MAX_SYS_CHARS:
-        log_event("warning", f"system_content 超长 ({len(system_content)} 字符)，强制截断", stage="tool_call", event="agent.ctx_overflow")
-        system_content = (system_content[:4000] + "\n\n...[中间历史因过长被截断]...\n\n" + system_content[-24000:])
-        
-    log_event("debug", f"system_content 长度: {len(system_content)} 字符", stage="debug", event="debug.sys_len")
+    sys_tokens = estimate_tokens(system_content)
+    if sys_tokens > SYSTEM_BUDGET_TOKENS:
+        log_event("warning", f"system_content 超预算 ({sys_tokens} tokens > {SYSTEM_BUDGET_TOKENS})，按窗口裁剪",
+                  stage="tool_call", event="agent.ctx_overflow")
+        system_content = fit_system(system_content, SYSTEM_BUDGET_TOKENS)
+
+    log_event("debug", f"system_content 长度: {len(system_content)} 字符 / ≈{estimate_tokens(system_content)} tokens",
+              stage="debug", event="debug.sys_len")
 
     messages = [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_input},
+        {"role": "user", "content": _build_user_content(user_input, images)},
     ]
 
     last_tool = None
@@ -244,15 +299,23 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
 
     for step in range(1, MAX_ATTEMPTS + 1):
         if stop_token is not None: stop_token.check()
-        messages = _shrink_messages(messages)
+        # 按真实 token 预算裁剪：超预算时逐级压缩老 tool 结果，仍超则整条丢弃最旧消息。
+        # 旧实现 _shrink_messages 只截内容不减条数，长任务会把 prompt 撑爆导致 llama.cpp 静默截断头部。
+        _before = len(messages)
+        messages = fit_messages(messages, PROMPT_BUDGET_TOKENS, keep_tail=SHRINK_KEEP_TAIL)
+        if len(messages) < _before:
+            log_event("debug", f"ctx_budget 丢弃 {_before - len(messages)} 条最旧消息", stage="tool_call", event="agent.ctx_budget_drop")
         log_event("info", f"agent 第 {step}/{MAX_ATTEMPTS} 轮", stage="tool_call")
         
         result = call_planner(messages, tools=all_schemas, retry=True, log_fn=log_event)
         if stop_token is not None: stop_token.check()
 
         if "error" in result:
-            log_event("error", f"agent 第 {step} 轮失败: {result.get('error')}", stage="tool_call")
-            print(f"❌ 模型调用失败: {result.get('error')}\n")
+            err_msg = str(result.get("error"))
+            log_event("error", f"agent 第 {step} 轮失败: {err_msg}", stage="tool_call")
+            print(f"❌ 模型调用失败: {err_msg}\n")
+            if final_content is None:
+                final_content = f"⚠️ 模型调用失败，本轮未能完成。\n错误信息：{err_msg[:300]}\n建议：稍后重试，或检查云端 API 配置/网络。"
             break
 
         msg = result.get("message", {}) or {}
@@ -273,7 +336,13 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                 log_event("warning", f"agent 第 {step} 轮无工具调用也无内容", stage="tool_call")
             break
 
-        messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls})
+        # 关键修复：thinking 模式下云端要求历史 assistant 必须回传真实 reasoning_content，
+        # 否则下一轮请求 400。这里把模型返回的 reasoning_content 一并存入历史。
+        _asst = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls}
+        _rc = msg.get("reasoning_content")
+        if _rc:
+            _asst["reasoning_content"] = _rc
+        messages.append(_asst)
 
         for tc in tool_calls:
             if stop_token is not None: stop_token.check()
@@ -393,6 +462,19 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
                 
                 # 触发干预后，清空护栏状态（重置计数和相似度窗口）
                 guard_engine.state.clear()
+                # 关键修复：本轮 assistant 声明了 N 个 tool_calls，但护栏在此提前 break，
+                # 后面未执行的 tool_calls 会缺少对应的 role=tool 响应，导致下一轮云端
+                # 直接 400（assistant tool_calls 必须被逐条 tool 消息应答）。
+                # 这里为剩余未执行的 tool_calls 补占位响应，保证配对完整。
+                _done_ids = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+                for _tc in tool_calls:
+                    _tid = _tc.get("id", "unknown")
+                    if _tid not in _done_ids:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": _tid,
+                            "content": "（该工具调用因系统干预被跳过，未执行）",
+                        })
                 # 由于我们在护栏里修改了 messages，需要 break 出当前 tool_calls 循环
                 # 让模型在下一轮读取新的系统干预信息
                 break 
@@ -415,6 +497,15 @@ def run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=
         final_result = call_planner(messages, tools=None, retry=True, log_fn=log_event)
         if "error" not in final_result:
             final_content = (final_result.get("message", {}).get("content") or "").strip() or None
+
+    if not final_content:
+        reason = stuck_reason or "模型未返回有效内容"
+        final_content = (
+            f"⚠️ 任务未能完成：{reason}\n"
+            f"已执行工具调用 {len(tool_history)} 次。\n"
+            "建议：换个更具体的描述重试，或检查模型/网络状态。"
+        )
+        log_event("warning", f"兜底回复已生成：{reason}", stage="tool_call", event="agent.fallback_reply")
 
     return final_content, last_tool, last_args, tool_history
 
@@ -449,9 +540,12 @@ def _busy_loop(runtime):
         elif cmd: print("⚠️  任务正在运行，输入 'stop' 停止")
 
 
-def handle_input(user_input, runtime):
+def handle_input(user_input, runtime, images=None):
     log_event("info", f"用户指令: {user_input}", stage="input")
     stop_token = runtime.stop_token
+
+    # 从输入中提取图片路径（@路径 或裸路径），剥离后作为多模态输入
+    user_input, images = _extract_images(user_input, images)
 
     try:
         maybe_compress(store=get_store(), llm_caller=call_planner, trigger_at=HISTORY_LIMIT, keep_recent=COMPRESS_KEEP_RECENT, max_chars=COMPRESS_MAX_CHARS)
@@ -461,15 +555,18 @@ def handle_input(user_input, runtime):
     focus_ctx = build_focus_context(get_store())
     get_context().reset()
 
-    r = route(user_input, log_fn=log_event)
+    r = route(user_input, log_fn=log_event, has_images=bool(images))
     if not r.get("ok"):
         log_event("warning", f"路由失败，降级为对话: {r.get('error')}", stage="route")
-        content = chat_with_planner([{"role": "system", "content": AGENT_SYSTEM_PROMPT}, {"role": "user", "content": user_input}])
-        if content:
-            log_event("info", content, stage="reply", console=f"Agent：{content}\n")
-            update_focus(last_user_input=user_input, last_intent="chat", last_tool=None, last_tool_args=None, last_result=content[:800], status="done")
-            append_turn(user_input=user_input, intent_summary="chat", tool=None, tool_args=None, result=content)
-            _reflect_and_remember(user_input, [], content)
+        _fallback_text = user_input or ("[用户发送了图片，未附带文字]" if images else "")
+        content = chat_with_planner([{"role": "system", "content": AGENT_SYSTEM_PROMPT}, {"role": "user", "content": _fallback_text}], images=images)
+        if not content:
+            content = f"⚠️ 路由与对话模型均未返回内容（路由错误：{r.get('error')}）。请检查云端 API 配置或网络后重试。"
+            log_event("error", "路由失败且对话降级无返回，已使用兜底回复", stage="reply")
+        log_event("info", content, stage="reply", console=f"Agent：{content}\n")
+        update_focus(last_user_input=user_input, last_intent="chat", last_tool=None, last_tool_args=None, last_result=content[:800], status="done")
+        append_turn(user_input=user_input, intent_summary="chat", tool=None, tool_args=None, result=content)
+        _reflect_and_remember(user_input, [], content)
         return
 
     intent_summary = r["intent_summary"]
@@ -481,18 +578,17 @@ def handle_input(user_input, runtime):
         log_event("debug", "检测到对话类关键词，强制降低任务复杂度", stage="route")
 
     try:
-        content, last_tool, last_args, tool_history = run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=stop_token)
+        content, last_tool, last_args, tool_history = run_agent(user_input, focus_ctx, intent_summary, hint, keywords, stop_token=stop_token, images=images)
     except StopException:
         log_event("info", "任务被用户停止", stage="runtime", event="agent.stopped")
         print("\n⏹️  已停止\n")
         append_turn(user_input=user_input, intent_summary=intent_summary, tool=None, tool_args=None, result="（任务被用户打断，未完成）", status="interrupted")
         return
 
-    if content:
-        log_event("info", content, stage="reply", console=f"Agent：{content}\n")
-    else:
-        print("\n❌ 任务未能完成（可能是后端模型失联或连续空响应），请检查 logs/llama-server.log\n")
-        log_event("error", "任务执行失败，无返回内容", stage="reply")
+    if not content:
+        content = "⚠️ 任务未能完成：模型连续空响应或后端失联。请检查云端 API 配置与网络后重试。"
+        log_event("error", "任务执行失败，无返回内容，已使用兜底回复", stage="reply")
+    log_event("info", content, stage="reply", console=f"Agent：{content}\n")
 
     ctx = get_context()
     artifacts = {"tool_history": tool_history}

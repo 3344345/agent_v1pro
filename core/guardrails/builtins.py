@@ -30,7 +30,7 @@ class SemanticDuplicateGuardrail(BaseGuardrail):
             if prev_tool == ctx.tool_name:
                 sim_args = difflib.SequenceMatcher(None, current_args_str, prev_args_str).ratio()
                 sim_out = difflib.SequenceMatcher(None, ctx.output, prev_out).ratio()
-                if sim_args > SIMILARITY_ARGS_THRESHOLD or sim_out > SIMILARITY_OUT_THRESHOLD:
+                if sim_args >= SIMILARITY_ARGS_THRESHOLD or sim_out >= SIMILARITY_OUT_THRESHOLD:
                     similar_count += 1
                     
         self.recent_actions.append((ctx.tool_name, current_args_str, ctx.output))
